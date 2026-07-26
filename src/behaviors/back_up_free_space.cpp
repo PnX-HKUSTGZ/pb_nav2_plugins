@@ -165,8 +165,7 @@ nav2_behaviors::ResultStatus BackUpFreeSpace::onCycleUpdate()
 
   vel_pub_->publish(std::move(cmd_vel));
 
-  return nav2_behaviors::ResultStatus{
-    nav2_behaviors::Status::RUNNING, BackUpAction::Result::NONE};
+  return nav2_behaviors::ResultStatus{nav2_behaviors::Status::RUNNING, BackUpAction::Result::NONE};
 }
 
 float BackUpFreeSpace::findBestDirection(
