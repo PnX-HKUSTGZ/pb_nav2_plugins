@@ -14,6 +14,9 @@
 
 #include "pb_nav2_plugins/layers/intensity_voxel_layer.hpp"
 
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
 #include <vector>
 
 #include "sensor_msgs/point_cloud2_iterator.hpp"
@@ -39,7 +42,8 @@ void IntensityVoxelLayer::onInitialize()
     node->get_parameter(name_ + ".footprint_clearing_enabled").as_bool();
   enabled_ = node->get_parameter(name_ + ".enabled").as_bool();
   max_obstacle_height_ = node->get_parameter(name_ + ".max_obstacle_height").as_double();
-  combination_method_ = node->get_parameter(name_ + ".combination_method").as_int();
+  combination_method_ =
+    combination_method_from_int(node->get_parameter(name_ + ".combination_method").as_int());
 
   size_z_ = node->declare_parameter(name_ + ".z_voxels", 16);
   origin_z_ = node->declare_parameter(name_ + ".origin_z", 16.0);
@@ -50,6 +54,10 @@ void IntensityVoxelLayer::onInitialize()
     node->declare_parameter(name_ + ".unknown_threshold", 15) + (VOXEL_BITS - size_z_);
   mark_threshold_ = node->declare_parameter(name_ + ".mark_threshold", 0);
   publish_voxel_ = node->declare_parameter(name_ + ".publish_voxel_map", false);
+  obstacle_confirmation_frames_ = static_cast<unsigned int>(std::max<std::int64_t>(
+    1, node->declare_parameter<std::int64_t>(name_ + ".obstacle_confirmation_frames", 2)));
+  obstacle_clear_frames_ = static_cast<unsigned int>(std::max<std::int64_t>(
+    1, node->declare_parameter<std::int64_t>(name_ + ".obstacle_clear_frames", 2)));
 
   if (publish_voxel_) {
     voxel_pub_ = node->create_publisher<nav2_msgs::msg::VoxelGrid>("voxel_grid", 1);
@@ -82,12 +90,19 @@ void IntensityVoxelLayer::matchSize()
 {
   ObstacleLayer::matchSize();
   voxel_grid_.resize(size_x_, size_y_, size_z_);
+  const auto cell_count = size_x_ * size_y_;
+  obstacle_hit_streak_.assign(cell_count, 0);
+  obstacle_miss_streak_.assign(cell_count, 0);
+  obstacle_confirmed_.assign(cell_count, 0);
 }
 
 void IntensityVoxelLayer::reset()
 {
   ObstacleLayer::reset();
   resetMaps();
+  std::fill(obstacle_hit_streak_.begin(), obstacle_hit_streak_.end(), 0);
+  std::fill(obstacle_miss_streak_.begin(), obstacle_miss_streak_.end(), 0);
+  std::fill(obstacle_confirmed_.begin(), obstacle_confirmed_.end(), 0);
 }
 
 void IntensityVoxelLayer::resetMaps()
@@ -120,6 +135,10 @@ void IntensityVoxelLayer::updateBounds(
   bool current = true;
   std::vector<Observation> observations;
   current = getMarkingObservations(observations) && current;
+
+  // Keep only the cells observed in this update. The costmap itself is reset
+  // above, so confirmed cells are rebuilt below from this temporal state.
+  std::vector<unsigned char> observed(size_x_ * size_y_, 0);
 
   // update the global current status
   current_ = current;
@@ -169,10 +188,42 @@ void IntensityVoxelLayer::updateBounds(
       // mark the cell in the voxel grid and check if we should also mark it in the costmap
       if (voxel_grid_.markVoxelInMap(mx, my, mz, mark_threshold_)) {
         unsigned int index = getIndex(mx, my);
-
-        costmap_[index] = LETHAL_OBSTACLE;
-        touch(static_cast<double>(px), static_cast<double>(py), min_x, min_y, max_x, max_y);
+        observed[index] = 1;
       }
+    }
+  }
+
+  // Temporal hysteresis: intermittent returns never become lethal, while a
+  // real obstacle is retained for one missed scan to avoid flicker.
+  for (unsigned int index = 0; index < observed.size(); ++index) {
+    if (observed[index] != 0) {
+      obstacle_miss_streak_[index] = 0;
+      obstacle_hit_streak_[index] =
+        std::min(obstacle_hit_streak_[index] + 1, obstacle_confirmation_frames_);
+      if (obstacle_hit_streak_[index] >= obstacle_confirmation_frames_) {
+        obstacle_confirmed_[index] = 1;
+      }
+    } else if (obstacle_confirmed_[index] != 0) {
+      obstacle_hit_streak_[index] = obstacle_confirmation_frames_;
+      obstacle_miss_streak_[index] =
+        std::min(obstacle_miss_streak_[index] + 1, obstacle_clear_frames_);
+      if (obstacle_miss_streak_[index] >= obstacle_clear_frames_) {
+        obstacle_confirmed_[index] = 0;
+        obstacle_hit_streak_[index] = 0;
+        obstacle_miss_streak_[index] = 0;
+      }
+    } else {
+      obstacle_hit_streak_[index] = 0;
+      obstacle_miss_streak_[index] = 0;
+    }
+
+    if (obstacle_confirmed_[index] != 0) {
+      costmap_[index] = LETHAL_OBSTACLE;
+      const unsigned int mx = index % size_x_;
+      const unsigned int my = index / size_x_;
+      double wx, wy;
+      mapToWorld(mx, my, wx, wy);
+      touch(wx, wy, min_x, min_y, max_x, max_y);
     }
   }
 
@@ -206,6 +257,34 @@ void IntensityVoxelLayer::updateOrigin(double new_origin_x, double new_origin_y)
   int cell_ox, cell_oy;
   cell_ox = static_cast<int>((new_origin_x - origin_x_) / resolution_);
   cell_oy = static_cast<int>((new_origin_y - origin_y_) / resolution_);
+
+  if (cell_ox != 0 || cell_oy != 0) {
+    const auto old_hit_streak = obstacle_hit_streak_;
+    const auto old_miss_streak = obstacle_miss_streak_;
+    const auto old_confirmed = obstacle_confirmed_;
+    std::fill(obstacle_hit_streak_.begin(), obstacle_hit_streak_.end(), 0);
+    std::fill(obstacle_miss_streak_.begin(), obstacle_miss_streak_.end(), 0);
+    std::fill(obstacle_confirmed_.begin(), obstacle_confirmed_.end(), 0);
+
+    for (unsigned int old_y = 0; old_y < size_y_; ++old_y) {
+      const int new_y = static_cast<int>(old_y) - cell_oy;
+      if (new_y < 0 || new_y >= static_cast<int>(size_y_)) {
+        continue;
+      }
+      for (unsigned int old_x = 0; old_x < size_x_; ++old_x) {
+        const int new_x = static_cast<int>(old_x) - cell_ox;
+        if (new_x < 0 || new_x >= static_cast<int>(size_x_)) {
+          continue;
+        }
+        const unsigned int old_index = getIndex(old_x, old_y);
+        const unsigned int new_index =
+          getIndex(static_cast<unsigned int>(new_x), static_cast<unsigned int>(new_y));
+        obstacle_hit_streak_[new_index] = old_hit_streak[old_index];
+        obstacle_miss_streak_[new_index] = old_miss_streak[old_index];
+        obstacle_confirmed_[new_index] = old_confirmed[old_index];
+      }
+    }
+  }
 
   // update the origin with the appropriate world coordinates
   origin_x_ = origin_x_ + cell_ox * resolution_;
