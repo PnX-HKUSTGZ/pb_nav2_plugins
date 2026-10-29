@@ -15,6 +15,8 @@
 #ifndef PB_NAV2_PLUGINS__LAYERS__INTENSITY_VOXEL_LAYER_HPP_
 #define PB_NAV2_PLUGINS__LAYERS__INTENSITY_VOXEL_LAYER_HPP_
 
+#include <vector>
+
 #include "laser_geometry/laser_geometry.hpp"
 #include "message_filters/subscriber.h"
 #include "nav2_costmap_2d/layer.hpp"
@@ -67,6 +69,13 @@ private:
   double z_resolution_, origin_z_;
   double min_obstacle_intensity_, max_obstacle_intensity_;
   unsigned int unknown_threshold_, mark_threshold_, size_z_;
+  // A point cloud can contain intermittent returns at tunnel edges. Keep a
+  // small amount of per-cell state so one-frame returns do not become lethal.
+  unsigned int obstacle_confirmation_frames_{2};
+  unsigned int obstacle_clear_frames_{2};
+  std::vector<unsigned int> obstacle_hit_streak_;
+  std::vector<unsigned int> obstacle_miss_streak_;
+  std::vector<unsigned char> obstacle_confirmed_;
   rclcpp::Clock::SharedPtr clock_;
 
   inline bool worldToMap3DFloat(
