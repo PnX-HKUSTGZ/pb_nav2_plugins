@@ -19,7 +19,9 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <vector>
 
+#include "geometry_msgs/msg/point.hpp"
 #include "geometry_msgs/msg/transform_stamped.hpp"
 #include "nav2_costmap_2d/costmap_layer.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
@@ -58,7 +60,10 @@ public:
 
 private:
   void onGrid(nav_msgs::msg::OccupancyGrid::ConstSharedPtr msg);
-  bool rebuildFromLatestGrid();
+  bool rebuildFromLatestGrid(double robot_x, double robot_y);
+  void clearRobotFootprint(
+    double robot_x, double robot_y, double robot_yaw, double * min_x, double * min_y,
+    double * max_x, double * max_y);
   bool transformPoint(
     const geometry_msgs::msg::Point & input, const geometry_msgs::msg::TransformStamped & transform,
     double & x, double & y) const;
@@ -76,9 +81,13 @@ private:
   int obstacle_threshold_{65};
   double stale_timeout_{0.75};
   double tf_timeout_{0.05};
+  double obstacle_marking_max_range_{0.0};
   bool enabled_{true};
+  bool footprint_clearing_enabled_{true};
   bool have_projected_grid_{false};
   bool warned_no_grid_{false};
+  std::vector<uint8_t> clearance_override_mask_;
+  std::vector<geometry_msgs::msg::Point> transformed_footprint_;
 };
 
 }  // namespace pb_nav2_costmap_2d

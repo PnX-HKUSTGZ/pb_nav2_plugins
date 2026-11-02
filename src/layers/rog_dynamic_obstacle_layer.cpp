@@ -20,6 +20,7 @@
 #include <utility>
 
 #include "geometry_msgs/msg/point_stamped.hpp"
+#include "nav2_costmap_2d/footprint.hpp"
 #include "pluginlib/class_list_macros.hpp"
 #include "tf2/exceptions.h"
 #include "tf2/utils.h"
@@ -41,15 +42,22 @@ void RogDynamicObstacleLayer::onInitialize()
   declareParameter("obstacle_threshold", rclcpp::ParameterValue(obstacle_threshold_));
   declareParameter("stale_timeout", rclcpp::ParameterValue(stale_timeout_));
   declareParameter("tf_timeout", rclcpp::ParameterValue(tf_timeout_));
+  declareParameter(
+    "obstacle_marking_max_range", rclcpp::ParameterValue(obstacle_marking_max_range_));
+  declareParameter("footprint_clearing_enabled", rclcpp::ParameterValue(true));
   node->get_parameter(name_ + ".enabled", enabled_);
   node->get_parameter(name_ + ".topic", topic_);
   node->get_parameter(name_ + ".obstacle_threshold", obstacle_threshold_);
   node->get_parameter(name_ + ".stale_timeout", stale_timeout_);
   node->get_parameter(name_ + ".tf_timeout", tf_timeout_);
+  node->get_parameter(name_ + ".obstacle_marking_max_range", obstacle_marking_max_range_);
+  node->get_parameter(name_ + ".footprint_clearing_enabled", footprint_clearing_enabled_);
 
   enabled_ = enabled_ && std::isfinite(stale_timeout_) && stale_timeout_ > 0.0;
   stale_timeout_ = std::max(0.05, stale_timeout_);
   tf_timeout_ = std::max(0.0, std::isfinite(tf_timeout_) ? tf_timeout_ : 0.05);
+  obstacle_marking_max_range_ =
+    std::max(0.0, std::isfinite(obstacle_marking_max_range_) ? obstacle_marking_max_range_ : 0.0);
   obstacle_threshold_ = std::clamp(obstacle_threshold_, 1, 100);
 
   const auto qos = rclcpp::QoS(rclcpp::KeepLast(1)).best_effort().durability_volatile();
@@ -59,8 +67,11 @@ void RogDynamicObstacleLayer::onInitialize()
   current_ = true;
 
   RCLCPP_INFO(
-    logger_, "ROG dynamic obstacle layer enabled=%s topic=%s threshold=%d stale_timeout=%.2fs",
-    enabled_ ? "true" : "false", topic_.c_str(), obstacle_threshold_, stale_timeout_);
+    logger_,
+    "ROG dynamic obstacle layer enabled=%s topic=%s threshold=%d stale_timeout=%.2fs "
+    "obstacle_marking_max_range=%.2fm (0=unlimited) footprint_clearing=%s",
+    enabled_ ? "true" : "false", topic_.c_str(), obstacle_threshold_, stale_timeout_,
+    obstacle_marking_max_range_, footprint_clearing_enabled_ ? "true" : "false");
 }
 
 void RogDynamicObstacleLayer::onGrid(nav_msgs::msg::OccupancyGrid::ConstSharedPtr msg)
@@ -86,6 +97,7 @@ void RogDynamicObstacleLayer::matchSize()
 {
   nav2_costmap_2d::CostmapLayer::matchSize();
   resetMaps();
+  clearance_override_mask_.assign(static_cast<size_t>(getSizeInCellsX()) * getSizeInCellsY(), 0U);
   have_projected_grid_ = false;
   projected_grid_sequence_ = 0U;
 }
@@ -93,6 +105,7 @@ void RogDynamicObstacleLayer::matchSize()
 void RogDynamicObstacleLayer::reset()
 {
   resetMaps();
+  clearance_override_mask_.assign(static_cast<size_t>(getSizeInCellsX()) * getSizeInCellsY(), 0U);
   have_projected_grid_ = false;
   projected_grid_sequence_ = 0U;
   std::lock_guard<std::mutex> lock(grid_mutex_);
@@ -119,7 +132,7 @@ bool RogDynamicObstacleLayer::transformPoint(
   return std::isfinite(x) && std::isfinite(y);
 }
 
-bool RogDynamicObstacleLayer::rebuildFromLatestGrid()
+bool RogDynamicObstacleLayer::rebuildFromLatestGrid(double robot_x, double robot_y)
 {
   nav_msgs::msg::OccupancyGrid::ConstSharedPtr grid;
   std::uint64_t sequence = 0U;
@@ -149,6 +162,7 @@ bool RogDynamicObstacleLayer::rebuildFromLatestGrid()
     // already marked the layer non-current.
     std::lock_guard<nav2_costmap_2d::Costmap2D::mutex_t> layer_lock(*getMutex());
     resetMaps();
+    clearance_override_mask_.assign(static_cast<size_t>(getSizeInCellsX()) * getSizeInCellsY(), 0U);
     have_projected_grid_ = false;
     projected_grid_sequence_ = 0U;
     current_ = false;
@@ -157,11 +171,6 @@ bool RogDynamicObstacleLayer::rebuildFromLatestGrid()
       "ROG dynamic obstacle grid stale (age=%.3fs timeout=%.3fs); cleared layer", receive_age,
       stale_timeout_);
     return false;
-  }
-
-  if (sequence == projected_grid_sequence_) {
-    current_ = true;
-    return have_projected_grid_;
   }
 
   const std::string global_frame = layered_costmap_->getGlobalFrameID();
@@ -191,20 +200,32 @@ bool RogDynamicObstacleLayer::rebuildFromLatestGrid()
   // result while the master costmap is being merged.
   std::lock_guard<nav2_costmap_2d::Costmap2D::mutex_t> layer_lock(*getMutex());
   resetMaps();
+  clearance_override_mask_.assign(static_cast<size_t>(getSizeInCellsX()) * getSizeInCellsY(), 0U);
   size_t source_obstacles = 0U;
+  size_t source_clearances = 0U;
   size_t marked_obstacles = 0U;
+  size_t marked_clearances = 0U;
+  size_t range_filtered_obstacles = 0U;
   size_t outside_costmap = 0U;
   size_t transform_failures = 0U;
+  const bool limit_obstacle_range =
+    obstacle_marking_max_range_ > 0.0 && std::isfinite(robot_x) && std::isfinite(robot_y);
   const double yaw = tf2::getYaw(grid->info.origin.orientation);
   const double c = std::cos(yaw);
   const double s = std::sin(yaw);
   for (uint32_t my = 0U; my < grid->info.height; ++my) {
     for (uint32_t mx = 0U; mx < grid->info.width; ++mx) {
       const int8_t value = grid->data[static_cast<size_t>(my) * grid->info.width + mx];
-      if (value < obstacle_threshold_) {
+      const bool obstacle = value >= obstacle_threshold_;
+      const bool clearance = value == 0;
+      if (!obstacle && !clearance) {
         continue;
       }
-      ++source_obstacles;
+      if (obstacle) {
+        ++source_obstacles;
+      } else {
+        ++source_clearances;
+      }
       const double lx = (static_cast<double>(mx) + 0.5) * grid->info.resolution;
       const double ly = (static_cast<double>(my) + 0.5) * grid->info.resolution;
       geometry_msgs::msg::Point point;
@@ -217,11 +238,25 @@ bool RogDynamicObstacleLayer::rebuildFromLatestGrid()
         ++transform_failures;
         continue;
       }
+      if (
+        obstacle && limit_obstacle_range &&
+        std::hypot(wx - robot_x, wy - robot_y) > obstacle_marking_max_range_) {
+        ++range_filtered_obstacles;
+        continue;
+      }
       unsigned int costmap_x = 0U;
       unsigned int costmap_y = 0U;
       if (worldToMap(wx, wy, costmap_x, costmap_y)) {
-        setCost(costmap_x, costmap_y, nav2_costmap_2d::LETHAL_OBSTACLE);
-        ++marked_obstacles;
+        const size_t costmap_index = getIndex(costmap_x, costmap_y);
+        if (obstacle) {
+          setCost(costmap_x, costmap_y, nav2_costmap_2d::LETHAL_OBSTACLE);
+          clearance_override_mask_[costmap_index] = 0U;
+          ++marked_obstacles;
+        } else if (getCost(costmap_x, costmap_y) != nav2_costmap_2d::LETHAL_OBSTACLE) {
+          setCost(costmap_x, costmap_y, nav2_costmap_2d::FREE_SPACE);
+          clearance_override_mask_[costmap_index] = 1U;
+          ++marked_clearances;
+        }
       } else {
         ++outside_costmap;
       }
@@ -230,11 +265,12 @@ bool RogDynamicObstacleLayer::rebuildFromLatestGrid()
 
   RCLCPP_INFO_THROTTLE(
     logger_, *clock_, 5000,
-    "ROG obstacle projection: sequence=%llu frame=%s->%s source=%zu marked=%zu outside=%zu "
-    "transform_failed=%zu",
+    "ROG obstacle projection: sequence=%llu frame=%s->%s obstacles=%zu/%zu "
+    "clearances=%zu/%zu range_filtered=%zu outside=%zu transform_failed=%zu",
     static_cast<unsigned long long>(sequence), grid->header.frame_id.c_str(), global_frame.c_str(),
-    source_obstacles, marked_obstacles, outside_costmap, transform_failures);
-  if (source_obstacles > 0U && marked_obstacles == 0U) {
+    marked_obstacles, source_obstacles, marked_clearances, source_clearances,
+    range_filtered_obstacles, outside_costmap, transform_failures);
+  if (source_obstacles > range_filtered_obstacles && marked_obstacles == 0U) {
     RCLCPP_WARN_THROTTLE(
       logger_, *clock_, 2000,
       "ROG grid contains %zu measured obstacle cells, but none project into the %s costmap "
@@ -248,13 +284,27 @@ bool RogDynamicObstacleLayer::rebuildFromLatestGrid()
   return marked_obstacles > 0U;
 }
 
+void RogDynamicObstacleLayer::clearRobotFootprint(
+  double robot_x, double robot_y, double robot_yaw, double * min_x, double * min_y, double * max_x,
+  double * max_y)
+{
+  if (!footprint_clearing_enabled_) {
+    return;
+  }
+
+  nav2_costmap_2d::transformFootprint(
+    robot_x, robot_y, robot_yaw, getFootprint(), transformed_footprint_);
+  std::lock_guard<nav2_costmap_2d::Costmap2D::mutex_t> layer_lock(*getMutex());
+  for (const auto & point : transformed_footprint_) {
+    touch(point.x, point.y, min_x, min_y, max_x, max_y);
+  }
+  setConvexPolygonCost(transformed_footprint_, nav2_costmap_2d::FREE_SPACE);
+}
+
 void RogDynamicObstacleLayer::updateBounds(
   double robot_x, double robot_y, double robot_yaw, double * min_x, double * min_y, double * max_x,
   double * max_y)
 {
-  (void)robot_x;
-  (void)robot_y;
-  (void)robot_yaw;
   if (!enabled_) {
     current_ = true;
     return;
@@ -264,7 +314,8 @@ void RogDynamicObstacleLayer::updateBounds(
     const auto * master = layered_costmap_->getCostmap();
     updateOrigin(master->getOriginX(), master->getOriginY());
   }
-  (void)rebuildFromLatestGrid();
+  (void)rebuildFromLatestGrid(robot_x, robot_y);
+  clearRobotFootprint(robot_x, robot_y, robot_yaw, min_x, min_y, max_x, max_y);
 
   // The layer is rebuilt each cycle. Cover the complete rolling window so the
   // master costmap cannot retain a cell from the previous ROG snapshot.
@@ -301,10 +352,22 @@ void RogDynamicObstacleLayer::updateCosts(
   const unsigned int size_y = std::min(getSizeInCellsY(), master_grid.getSizeInCellsY());
   size_t source_lethal = 0U;
   size_t merged_lethal = 0U;
+  size_t cleared_static = 0U;
   size_t master_lethal_after = 0U;
   for (unsigned int y = 0U; y < size_y; ++y) {
     for (unsigned int x = 0U; x < size_x; ++x) {
       const unsigned char layer_cost = getCost(x, y);
+      const size_t cell_index = getIndex(x, y);
+      if (
+        cell_index < clearance_override_mask_.size() &&
+        clearance_override_mask_[cell_index] != 0U &&
+        layer_cost != nav2_costmap_2d::LETHAL_OBSTACLE) {
+        if (master_grid.getCost(x, y) != nav2_costmap_2d::FREE_SPACE) {
+          ++cleared_static;
+        }
+        master_grid.setCost(x, y, nav2_costmap_2d::FREE_SPACE);
+        continue;
+      }
       if (layer_cost == nav2_costmap_2d::NO_INFORMATION) {
         continue;
       }
@@ -328,9 +391,9 @@ void RogDynamicObstacleLayer::updateCosts(
 
   RCLCPP_INFO_THROTTLE(
     logger_, *clock_, 2000,
-    "ROG master merge: layer_lethal=%zu merged_lethal=%zu master_lethal_after=%zu "
-    "window=%ux%u bounds_ignored=true",
-    source_lethal, merged_lethal, master_lethal_after, size_x, size_y);
+    "ROG master merge: layer_lethal=%zu merged_lethal=%zu cleared_static=%zu "
+    "master_lethal_after=%zu window=%ux%u bounds_ignored=true",
+    source_lethal, merged_lethal, cleared_static, master_lethal_after, size_x, size_y);
 }
 
 }  // namespace pb_nav2_costmap_2d
